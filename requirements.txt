@@ -1,0 +1,7 @@
+--extra-index-url https://download.pytorch.org/whl/cu132
+
+airllm==4.0.0
+transformers==5.17.0
+accelerate==1.15.0
+torch==2.14.0+cu132
+bitsandbytes==0.50.2
