@@ -8,13 +8,14 @@ from pathlib import Path
 import torch
 
 
-# Change this value manually to either "resident" or "airllm".
-RUNTIME_MODE = "resident"
+# Change this value manually to "resident", "airllm", or "hybrid".
+RUNTIME_MODE = "airllm"
 MODEL_ID = "Qwen/Qwen3-14B"
 AIRLLM_SHARD_PATH = Path(r"C:\AI\airllm-layers")
 MAX_SEQUENCE_LENGTH = 512
 MAX_NEW_TOKENS = 64
 CUDA_DEVICE = "cuda:0"
+HYBRID_RESIDENT_DECODER_LAYERS = 24
 
 MESSAGES = [
     {
@@ -155,17 +156,36 @@ def load_airllm_model():
     return model
 
 
+def load_hybrid_model():
+    from hybrid_airllm import HybridQwen3AirLLM
+
+    print(
+        "Loading fixed-budget hybrid AirLLM in native BF16. The first 24 decoder layers "
+        "and boundary modules remain on cuda:0; the final 16 decoder layers are streamed. "
+        "This mode is not fully GPU-resident."
+    )
+    return HybridQwen3AirLLM(
+        MODEL_ID,
+        resident_decoder_layers=HYBRID_RESIDENT_DECODER_LAYERS,
+        layer_shards_saving_path=str(AIRLLM_SHARD_PATH),
+        max_seq_len=MAX_SEQUENCE_LENGTH,
+        device=CUDA_DEVICE,
+    )
+
+
 def load_runtime():
     from transformers import AutoTokenizer
 
-    if RUNTIME_MODE not in {"resident", "airllm"}:
+    if RUNTIME_MODE not in {"resident", "airllm", "hybrid"}:
         raise ValueError(
-            f"Unsupported RUNTIME_MODE {RUNTIME_MODE!r}. Choose either 'resident' or 'airllm'."
+            f"Unsupported RUNTIME_MODE {RUNTIME_MODE!r}. Choose 'resident', 'airllm', or 'hybrid'."
         )
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     if RUNTIME_MODE == "resident":
         return load_resident_model(), tokenizer, True
+    if RUNTIME_MODE == "hybrid":
+        return load_hybrid_model(), tokenizer, False
     return load_airllm_model(), tokenizer, False
 
 
@@ -221,6 +241,15 @@ def generate_response(model, tokenizer, input_ids: torch.Tensor):
         "peak_cuda_allocated_gib": torch.cuda.max_memory_allocated(CUDA_DEVICE) / (1024**3),
         "peak_cuda_reserved_gib": torch.cuda.max_memory_reserved(CUDA_DEVICE) / (1024**3),
     }
+    if RUNTIME_MODE == "hybrid":
+        metrics.update(
+            {
+                "resident_decoder_layers": HYBRID_RESIDENT_DECODER_LAYERS,
+                "streamed_decoder_layers": 40 - HYBRID_RESIDENT_DECODER_LAYERS,
+                "resident_shard_gib": 17.66,
+                "streamed_weight_gib_per_forward": 9.84,
+            }
+        )
     return answer, metrics
 
 
@@ -229,6 +258,20 @@ def print_results(answer: str, metrics: dict) -> None:
     rows = [
         ("Runtime mode", metrics["runtime_mode"]),
         ("Fully GPU-resident", "Yes" if metrics["fully_gpu_resident"] else "No"),
+    ]
+    if metrics["runtime_mode"] == "hybrid":
+        rows.extend(
+            [
+                ("Resident decoder layers", str(metrics["resident_decoder_layers"])),
+                ("Streamed decoder layers", str(metrics["streamed_decoder_layers"])),
+                ("Resident shard size", f'{metrics["resident_shard_gib"]:.2f} GiB'),
+                (
+                    "Streamed weights/forward",
+                    f'{metrics["streamed_weight_gib_per_forward"]:.2f} GiB',
+                ),
+            ]
+        )
+    rows.extend([
         ("Input tokens", f'{metrics["input_tokens"]:,}'),
         ("Generated tokens", f'{metrics["generated_tokens"]:,}'),
         ("Generation time", f'{metrics["generation_seconds"]:.2f} seconds'),
@@ -236,7 +279,7 @@ def print_results(answer: str, metrics: dict) -> None:
         ("Generation speed", f'{metrics["generated_tokens_per_second"]:.2f} tokens/second'),
         ("Peak CUDA allocated", f'{metrics["peak_cuda_allocated_gib"]:.2f} GiB'),
         ("Peak CUDA reserved", f'{metrics["peak_cuda_reserved_gib"]:.2f} GiB'),
-    ]
+    ])
 
     print(f"\n{separator}")
     print("MODEL RESPONSE")
