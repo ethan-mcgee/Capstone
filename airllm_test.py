@@ -2,7 +2,7 @@ import time
 
 SCRIPT_START_TIME = time.perf_counter()
 
-import json
+import logging
 from pathlib import Path
 
 import torch
@@ -26,6 +26,19 @@ MESSAGES = [
         "content": "Explain what machine learning is in three sentences.",
     },
 ]
+
+
+class SuppressBitsAndBytesCastNotice(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not (
+            record.name == "bitsandbytes.autograd._functions"
+            and record.getMessage().startswith("MatMul8bitLt: inputs will be cast")
+        )
+
+
+def configure_terminal_logging() -> None:
+    bitsandbytes_logger = logging.getLogger("bitsandbytes.autograd._functions")
+    bitsandbytes_logger.addFilter(SuppressBitsAndBytesCastNotice())
 
 
 def require_cuda() -> None:
@@ -211,7 +224,34 @@ def generate_response(model, tokenizer, input_ids: torch.Tensor):
     return answer, metrics
 
 
+def print_results(answer: str, metrics: dict) -> None:
+    separator = "=" * 62
+    rows = [
+        ("Runtime mode", metrics["runtime_mode"]),
+        ("Fully GPU-resident", "Yes" if metrics["fully_gpu_resident"] else "No"),
+        ("Input tokens", f'{metrics["input_tokens"]:,}'),
+        ("Generated tokens", f'{metrics["generated_tokens"]:,}'),
+        ("Generation time", f'{metrics["generation_seconds"]:.2f} seconds'),
+        ("End-to-end time", f'{metrics["end_to_end_seconds"]:.2f} seconds'),
+        ("Generation speed", f'{metrics["generated_tokens_per_second"]:.2f} tokens/second'),
+        ("Peak CUDA allocated", f'{metrics["peak_cuda_allocated_gib"]:.2f} GiB'),
+        ("Peak CUDA reserved", f'{metrics["peak_cuda_reserved_gib"]:.2f} GiB'),
+    ]
+
+    print(f"\n{separator}")
+    print("MODEL RESPONSE")
+    print(separator)
+    print(answer.strip())
+    print(f"\n{separator}")
+    print("PERFORMANCE SUMMARY")
+    print(separator)
+    for label, value in rows:
+        print(f"{label:<27} {value}")
+    print(separator)
+
+
 def main() -> None:
+    configure_terminal_logging()
     require_cuda()
     model, tokenizer, fully_gpu_resident = load_runtime()
     input_ids = prepare_input(tokenizer)
@@ -220,10 +260,7 @@ def main() -> None:
     if metrics["fully_gpu_resident"] != fully_gpu_resident:
         raise AssertionError("Runtime residency state changed unexpectedly.")
 
-    print("\nModel response:\n")
-    print(answer)
-    print("\nPerformance metrics:")
-    print(json.dumps(metrics, indent=2))
+    print_results(answer, metrics)
 
 
 if __name__ == "__main__":
