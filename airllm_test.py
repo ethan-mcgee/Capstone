@@ -28,6 +28,7 @@ input_ids = model.tokenizer.apply_chat_template(
     add_generation_prompt=True,
     tokenize=True,
     return_tensors="pt",
+    return_dict=False,
 )
 
 input_length = input_ids.shape[-1]
