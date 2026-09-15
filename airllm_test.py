@@ -51,31 +51,34 @@ def is_cuda_zero(device: object) -> bool:
 
 def validate_resident_model(model: torch.nn.Module) -> None:
     device_map = getattr(model, "hf_device_map", None)
-    if not device_map:
-        raise RuntimeError(
-            "Transformers did not expose hf_device_map, so complete GPU residency cannot be "
-            "verified. No AirLLM fallback was attempted."
-        )
-
-    invalid_mappings = {
-        name or "<root>": str(device)
-        for name, device in device_map.items()
-        if not is_cuda_zero(device)
-    }
-    if invalid_mappings:
-        raise RuntimeError(
-            "Resident loading placed model components outside cuda:0: "
-            f"{invalid_mappings}. Free more VRAM and retry. No AirLLM fallback was attempted."
-        )
+    if device_map:
+        invalid_mappings = {
+            name or "<root>": str(device)
+            for name, device in device_map.items()
+            if not is_cuda_zero(device)
+        }
+        if invalid_mappings:
+            raise RuntimeError(
+                "Resident loading placed model components outside cuda:0: "
+                f"{invalid_mappings}. Free more VRAM and retry. No AirLLM fallback was attempted."
+            )
 
     invalid_tensors = []
+    tensor_count = 0
     for tensor_kind, named_tensors in (
         ("parameter", model.named_parameters()),
         ("buffer", model.named_buffers()),
     ):
         for name, tensor in named_tensors:
+            tensor_count += 1
             if not is_cuda_zero(tensor.device):
                 invalid_tensors.append(f"{tensor_kind} {name}: {tensor.device}")
+
+    if tensor_count == 0:
+        raise RuntimeError(
+            "The loaded model exposes no parameters or buffers, so GPU residency cannot be "
+            "verified. No AirLLM fallback was attempted."
+        )
 
     if invalid_tensors:
         preview = ", ".join(invalid_tensors[:10])
@@ -86,8 +89,12 @@ def validate_resident_model(model: torch.nn.Module) -> None:
             f"{preview}. Free more VRAM and retry. No AirLLM fallback was attempted."
         )
 
-    printable_map = {name or "<root>": str(device) for name, device in device_map.items()}
-    print(f"Validated resident device map: {printable_map}")
+    if device_map:
+        printable_map = {name or "<root>": str(device) for name, device in device_map.items()}
+        print(f"Validated resident device map: {printable_map}")
+    else:
+        print("Transformers did not expose hf_device_map for this fixed single-device load.")
+    print(f"Validated {tensor_count} model parameters and buffers on cuda:0.")
 
 
 def load_resident_model():
