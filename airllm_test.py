@@ -7,15 +7,20 @@ from pathlib import Path
 
 import torch
 
+from model_profiles import get_model_profile, model_shard_path
 
-# Change this value manually to "resident", "airllm", or "hybrid".
+
+# Change these source constants to select a model and runtime.
+MODEL_PROFILE = "llama"  # "llama" or "qwen"
 RUNTIME_MODE = "airllm"
-MODEL_ID = "Qwen/Qwen3-14B"
-AIRLLM_SHARD_PATH = Path(r"C:\AI\airllm-layers")
+AIRLLM_SHARD_ROOT = Path(r"C:\AI\airllm-layers")
 MAX_SEQUENCE_LENGTH = 512
 MAX_NEW_TOKENS = 64
 CUDA_DEVICE = "cuda:0"
-HYBRID_RESIDENT_DECODER_LAYERS = 24
+
+MODEL = get_model_profile(MODEL_PROFILE)
+MODEL_ID = MODEL.model_id
+AIRLLM_SHARD_PATH = model_shard_path(AIRLLM_SHARD_ROOT, MODEL)
 
 MESSAGES = [
     {
@@ -45,7 +50,7 @@ def configure_terminal_logging() -> None:
 def require_cuda() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "CUDA is required for both runtime modes, but PyTorch cannot access a CUDA GPU. "
+            "CUDA is required for every runtime mode, but PyTorch cannot access a CUDA GPU. "
             "Install the CUDA-enabled dependency stack documented in README.md and verify the "
             "NVIDIA driver."
         )
@@ -114,7 +119,10 @@ def validate_resident_model(model: torch.nn.Module) -> None:
 def load_resident_model():
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
-    print("Loading the 8-bit model fully into cuda:0 (CPU and disk offload disabled)...")
+    print(
+        f"Loading {MODEL_ID} in 8-bit fully into cuda:0 "
+        "(CPU and disk offload disabled)..."
+    )
     quantization_config = BitsAndBytesConfig(
         load_in_8bit=True,
         llm_int8_enable_fp32_cpu_offload=False,
@@ -130,7 +138,7 @@ def load_resident_model():
         validate_resident_model(model)
     except Exception as exc:
         raise RuntimeError(
-            "Resident mode could not load Qwen3-14B entirely on cuda:0 in 8-bit precision. "
+            f"Resident mode could not load {MODEL_ID} entirely on cuda:0 in 8-bit precision. "
             "Verify the pinned dependencies, CUDA support, checkpoint access, and available VRAM. "
             "The script will not silently switch to AirLLM; set RUNTIME_MODE = \"airllm\" "
             "explicitly if layer streaming is desired."
@@ -144,8 +152,8 @@ def load_airllm_model():
     from airllm import AutoModel
 
     print(
-        "Loading with AirLLM layer streaming. This mode moves layers through cuda:0 as needed "
-        "and is not fully GPU-resident."
+        f"Loading {MODEL_ID} with AirLLM layer streaming from {AIRLLM_SHARD_PATH}. "
+        "This mode moves layers through cuda:0 as needed and is not fully GPU-resident."
     )
     model = AutoModel.from_pretrained(
         MODEL_ID,
@@ -157,16 +165,17 @@ def load_airllm_model():
 
 
 def load_hybrid_model():
-    from hybrid_airllm import HybridQwen3AirLLM
+    from hybrid_airllm import HybridAirLLM
 
     print(
-        "Loading fixed-budget hybrid AirLLM in native BF16. The first 24 decoder layers "
-        "and boundary modules remain on cuda:0; the final 16 decoder layers are streamed. "
-        "This mode is not fully GPU-resident."
+        f"Loading {MODEL_ID} with fixed-budget hybrid AirLLM in native BF16 from "
+        f"{AIRLLM_SHARD_PATH}. The first {MODEL.resident_decoder_layers} decoder layers "
+        f"and boundary modules remain on cuda:0; the final {MODEL.streamed_decoder_layers} "
+        "decoder layers are streamed. This mode is not fully GPU-resident."
     )
-    return HybridQwen3AirLLM(
+    return HybridAirLLM(
         MODEL_ID,
-        resident_decoder_layers=HYBRID_RESIDENT_DECODER_LAYERS,
+        resident_decoder_layers=MODEL.resident_decoder_layers,
         layer_shards_saving_path=str(AIRLLM_SHARD_PATH),
         max_seq_len=MAX_SEQUENCE_LENGTH,
         device=CUDA_DEVICE,
@@ -229,6 +238,7 @@ def generate_response(model, tokenizer, input_ids: torch.Tensor):
 
     generated_token_count = generated_token_ids.numel()
     metrics = {
+        "model_id": MODEL_ID,
         "runtime_mode": RUNTIME_MODE,
         "fully_gpu_resident": RUNTIME_MODE == "resident",
         "input_tokens": input_token_count,
@@ -244,10 +254,10 @@ def generate_response(model, tokenizer, input_ids: torch.Tensor):
     if RUNTIME_MODE == "hybrid":
         metrics.update(
             {
-                "resident_decoder_layers": HYBRID_RESIDENT_DECODER_LAYERS,
-                "streamed_decoder_layers": 40 - HYBRID_RESIDENT_DECODER_LAYERS,
-                "resident_shard_gib": 17.66,
-                "streamed_weight_gib_per_forward": 9.84,
+                "resident_decoder_layers": MODEL.resident_decoder_layers,
+                "streamed_decoder_layers": MODEL.streamed_decoder_layers,
+                "resident_shard_gib": model.resident_shard_bytes / (1024**3),
+                "streamed_weight_gib_per_forward": model.streamed_weight_bytes / (1024**3),
             }
         )
     return answer, metrics
@@ -256,6 +266,7 @@ def generate_response(model, tokenizer, input_ids: torch.Tensor):
 def print_results(answer: str, metrics: dict) -> None:
     separator = "=" * 62
     rows = [
+        ("Model", metrics["model_id"]),
         ("Runtime mode", metrics["runtime_mode"]),
         ("Fully GPU-resident", "Yes" if metrics["fully_gpu_resident"] else "No"),
     ]

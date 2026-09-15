@@ -1,4 +1,4 @@
-"""Fixed-budget AirLLM runtime for Qwen3-14B on an RTX 3090 Ti."""
+"""Fixed-budget, profile-driven hybrid AirLLM runtime."""
 
 from __future__ import annotations
 
@@ -8,19 +8,13 @@ from pathlib import Path
 
 import torch
 from airllm import AirLLMBaseModel
-
+from model_profiles import MODEL_PROFILES_BY_ID
 
 SUPPORTED_AIRLLM_VERSION = "4.0.0"
-SUPPORTED_MODEL_ID = "Qwen/Qwen3-14B"
-QWEN3_14B_DECODER_LAYERS = 40
-HYBRID_RESIDENT_DECODER_LAYERS = 24
-HYBRID_RESIDENT_SHARD_GIB = 17.66
-HYBRID_STREAMED_WEIGHT_GIB = 9.84
 
 
 def build_hybrid_partition(
-    total_decoder_layers: int,
-    resident_decoder_layers: int,
+    total_decoder_layers: int, resident_decoder_layers: int
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Return the resident prefix and streamed suffix decoder indices."""
     if total_decoder_layers <= 0:
@@ -30,9 +24,10 @@ def build_hybrid_partition(
             "resident_decoder_layers must be greater than zero and smaller than "
             f"total_decoder_layers ({total_decoder_layers}); got {resident_decoder_layers}."
         )
-    resident = tuple(range(resident_decoder_layers))
-    streamed = tuple(range(resident_decoder_layers, total_decoder_layers))
-    return resident, streamed
+    return (
+        tuple(range(resident_decoder_layers)),
+        tuple(range(resident_decoder_layers, total_decoder_layers)),
+    )
 
 
 def validate_airllm_compatibility(base_class=AirLLMBaseModel) -> None:
@@ -41,7 +36,6 @@ def validate_airllm_compatibility(base_class=AirLLMBaseModel) -> None:
         installed_version = version("airllm")
     except PackageNotFoundError as exc:
         raise RuntimeError("AirLLM is not installed; version 4.0.0 is required.") from exc
-
     if installed_version != SUPPORTED_AIRLLM_VERSION:
         raise RuntimeError(
             "Hybrid mode requires AirLLM 4.0.0 because it relies on protected streaming "
@@ -64,52 +58,54 @@ def validate_airllm_compatibility(base_class=AirLLMBaseModel) -> None:
             continue
         actual_parameters = tuple(inspect.signature(method).parameters)
         if actual_parameters != expected_parameters:
-            drift.append(
-                f"{name}{actual_parameters!r} does not match {expected_parameters!r}"
-            )
-
+            drift.append(f"{name}{actual_parameters!r} does not match {expected_parameters!r}")
     init_parameters = inspect.signature(base_class.__init__).parameters
     for name in ("install_hooks", "load_resident", "prefetching"):
         if name not in init_parameters:
             drift.append(f"AirLLMBaseModel.__init__ is missing {name}")
-
     if drift:
         raise RuntimeError(
             "AirLLM protected interface drift prevents safe hybrid loading: "
             + "; ".join(drift)
-            + ". Install airllm==4.0.0 or update HybridQwen3AirLLM for the new interface."
+            + ". Install airllm==4.0.0 or update HybridAirLLM for the new interface."
         )
 
 
-class HybridQwen3AirLLM(AirLLMBaseModel):
-    """Keep a fixed Qwen3-14B BF16 prefix resident and stream its suffix."""
+class HybridAirLLM(AirLLMBaseModel):
+    """Keep a profile's fixed native-BF16 prefix resident and stream its suffix."""
 
     def __init__(
         self,
         model_local_path_or_repo_id: str,
         *,
-        resident_decoder_layers: int = HYBRID_RESIDENT_DECODER_LAYERS,
+        resident_decoder_layers: int | None = None,
         **kwargs,
     ) -> None:
         validate_airllm_compatibility()
-        if model_local_path_or_repo_id != SUPPORTED_MODEL_ID:
+        try:
+            profile = MODEL_PROFILES_BY_ID[model_local_path_or_repo_id]
+        except KeyError as exc:
+            supported = ", ".join(repr(model_id) for model_id in MODEL_PROFILES_BY_ID)
             raise ValueError(
-                f"Hybrid mode supports only {SUPPORTED_MODEL_ID!r}; "
-                f"got {model_local_path_or_repo_id!r}."
-            )
+                f"Hybrid mode supports only {supported}; got {model_local_path_or_repo_id!r}."
+            ) from exc
+        requested_layers = (
+            profile.resident_decoder_layers
+            if resident_decoder_layers is None
+            else resident_decoder_layers
+        )
         if kwargs.get("compression") is not None:
             raise ValueError("Hybrid mode preserves native BF16 weights; compression is unsupported.")
-        if resident_decoder_layers != HYBRID_RESIDENT_DECODER_LAYERS:
+        if requested_layers != profile.resident_decoder_layers:
             raise ValueError(
-                "Hybrid mode uses a fixed 24-layer resident prefix for the RTX 3090 Ti; "
-                f"got {resident_decoder_layers}. Dynamic layer selection is not supported."
+                f"Hybrid mode uses a fixed {profile.resident_decoder_layers}-layer resident "
+                f"prefix for {profile.model_id}; got {requested_layers}. Dynamic layer selection "
+                "is not supported."
             )
-
-        build_hybrid_partition(QWEN3_14B_DECODER_LAYERS, resident_decoder_layers)
-        self.resident_decoder_layer_count = resident_decoder_layers
-        kwargs["dtype"] = torch.bfloat16
-        kwargs["compression"] = None
-        kwargs["prefetching"] = True
+        build_hybrid_partition(profile.decoder_layers, requested_layers)
+        self.profile = profile
+        self.resident_decoder_layer_count = requested_layers
+        kwargs.update(dtype=torch.bfloat16, compression=None, prefetching=True)
         super().__init__(model_local_path_or_repo_id, **kwargs)
 
     def _shard_size(self, layer_name: str) -> int:
@@ -126,18 +122,19 @@ class HybridQwen3AirLLM(AirLLMBaseModel):
             )
         return candidates[0].stat().st_size
 
-    def _check_vram_budget(self, resident_names: tuple[str, ...], streamed_names: tuple[str, ...]) -> None:
+    def _check_vram_budget(
+        self, resident_names: tuple[str, ...], streamed_names: tuple[str, ...]
+    ) -> None:
         resident_bytes = sum(self._shard_size(name) for name in resident_names)
-        active_streamed_bytes = max(self._shard_size(name) for name in streamed_names)
-        required_bytes = resident_bytes + active_streamed_bytes
+        streamed_sizes = tuple(self._shard_size(name) for name in streamed_names)
+        required_bytes = resident_bytes + max(streamed_sizes)
         free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
-
         self.resident_shard_bytes = resident_bytes
-        self.streamed_weight_bytes = sum(self._shard_size(name) for name in streamed_names)
+        self.streamed_weight_bytes = sum(streamed_sizes)
         if free_bytes < required_bytes:
             gib = 1024**3
             raise RuntimeError(
-                "Insufficient VRAM for fixed hybrid mode: requested "
+                f"Insufficient VRAM for fixed hybrid mode with {self.profile.model_id}: requested "
                 f"{self.resident_decoder_layer_count} resident decoder layers, resident shards "
                 f"{resident_bytes / gib:.2f} GiB, and one active streamed layer require at least "
                 f"{required_bytes / gib:.2f} GiB; cuda:0 currently has "
@@ -168,13 +165,12 @@ class HybridQwen3AirLLM(AirLLMBaseModel):
             free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
             gib = 1024**3
             raise RuntimeError(
-                "Failed to load the fixed hybrid resident set: requested "
-                f"{self.resident_decoder_layer_count} resident decoder layers, resident shards "
-                f"{self.resident_shard_bytes / gib:.2f} GiB; cuda:0 now has "
+                f"Failed to load the fixed hybrid resident set for {self.profile.model_id}: "
+                f"requested {self.resident_decoder_layer_count} resident decoder layers, resident "
+                f"shards {self.resident_shard_bytes / gib:.2f} GiB; cuda:0 now has "
                 f"{free_bytes / gib:.2f} GiB free of {total_bytes / gib:.2f} GiB total. "
                 "No layer-count reduction or runtime fallback was attempted."
             ) from exc
-
         for idx in resident_indices:
             self._require_module_on_cuda(self.layers[idx], self.layer_names[idx])
 
@@ -189,12 +185,11 @@ class HybridQwen3AirLLM(AirLLMBaseModel):
 
     def _install_streaming_hooks(self) -> None:
         total_decoder_layers = len(self.layer_names) - 3
-        if total_decoder_layers != QWEN3_14B_DECODER_LAYERS:
+        if total_decoder_layers != self.profile.decoder_layers:
             raise RuntimeError(
-                "Hybrid mode requires Qwen3-14B with exactly "
-                f"{QWEN3_14B_DECODER_LAYERS} decoder layers; found {total_decoder_layers}."
+                f"Hybrid mode requires {self.profile.model_id} with exactly "
+                f"{self.profile.decoder_layers} decoder layers; found {total_decoder_layers}."
             )
-
         resident_decoders, streamed_decoders = build_hybrid_partition(
             total_decoder_layers, self.resident_decoder_layer_count
         )
@@ -209,12 +204,10 @@ class HybridQwen3AirLLM(AirLLMBaseModel):
         )
         self._streamed_indices = [decoder_layer_indices[index] for index in streamed_decoders]
         self._streamed_set = set(self._streamed_indices)
-
         resident_names = tuple(self.layer_names[index] for index in resident_indices)
         streamed_names = tuple(self.layer_names[index] for index in self._streamed_indices)
         self._check_vram_budget(resident_names, streamed_names)
         self._load_fixed_resident_modules(resident_indices)
-
         self.tie_word_embeddings = False
         self._setup_expert_streaming()
         for idx in self._streamed_indices:
@@ -222,13 +215,17 @@ class HybridQwen3AirLLM(AirLLMBaseModel):
             layer._airllm_idx = idx
             layer.register_forward_pre_hook(self._pre_hook)
             layer.register_forward_hook(self._post_hook)
-
-        # Start layer 24's disk read before the first resident decoder executes.
         self.layers[1].register_forward_pre_hook(self._prefetch_first_streamed)
 
+        gib = 1024**3
         print(
-            f"Hybrid layout loaded in native BF16: {HYBRID_RESIDENT_DECODER_LAYERS} "
-            f"resident decoder layers, {QWEN3_14B_DECODER_LAYERS - HYBRID_RESIDENT_DECODER_LAYERS} "
-            f"streamed decoder layers, {HYBRID_RESIDENT_SHARD_GIB:.2f} GiB resident shards, "
-            f"and {HYBRID_STREAMED_WEIGHT_GIB:.2f} GiB streamed per forward."
+            f"Hybrid layout loaded for {self.profile.model_id} in native BF16: "
+            f"{self.profile.resident_decoder_layers} resident decoder layers, "
+            f"{self.profile.streamed_decoder_layers} streamed decoder layers, "
+            f"{self.resident_shard_bytes / gib:.2f} GiB resident shards, and "
+            f"{self.streamed_weight_bytes / gib:.2f} GiB streamed per forward."
         )
+
+
+# Compatibility alias for callers of the former single-model implementation.
+HybridQwen3AirLLM = HybridAirLLM

@@ -1,12 +1,42 @@
-# Qwen3-14B inference test
+# Llama 3.1 8B and Qwen3-14B inference benchmark
 
-`airllm_test.py` runs the same fixed Qwen3-14B prompt with deterministic generation in one of three modes. The checked-in selection is `airllm`.
+`airllm_test.py` runs the same prompt and deterministic generation settings with either `meta-llama/Llama-3.1-8B-Instruct` or `Qwen/Qwen3-14B`. The checked-in defaults are the `llama` model profile and the `airllm` runtime mode.
 
-- `resident` loads the entire model on `cuda:0` with bitsandbytes 8-bit quantization and rejects CPU, disk, or meta placement.
-- `airllm` uses AirLLM to stream one layer at a time through `cuda:0`. It uses less VRAM, but the model is not fully GPU-resident.
-- `hybrid` is a fixed RTX 3090 Ti layout for `Qwen/Qwen3-14B`. It keeps native BF16 embeddings, final normalization, the language-model head, and decoder layers 0 through 23 on `cuda:0`. Decoder layers 24 through 39 retain AirLLM 4.0.0's pinned-memory and one-layer-ahead streaming behavior. It is not fully GPU-resident.
+## Model and runtime selection
 
-Set `RUNTIME_MODE` near the top of `airllm_test.py` to select a mode. The script never switches modes automatically after a loading failure.
+Edit these constants near the top of `airllm_test.py`:
+
+```python
+MODEL_PROFILE = "llama"  # "llama" or "qwen"
+RUNTIME_MODE = "airllm"  # "resident", "airllm", or "hybrid"
+```
+
+Model selection intentionally remains source-level so benchmark configuration is visible in the checked-in script. The runtime modes are:
+
+- `resident`: loads the selected model entirely on `cuda:0` with bitsandbytes 8-bit quantization and rejects CPU, disk, or meta placement.
+- `airllm`: streams one layer at a time through `cuda:0`. It uses less VRAM and is not fully GPU-resident.
+- `hybrid`: keeps a fixed native-BF16 prefix and the boundary modules on `cuda:0`, then streams the decoder suffix with AirLLM 4.0.0's pinned-memory and one-layer-ahead prefetch behavior. It is not fully GPU-resident.
+
+The script never changes models, reduces a hybrid partition, or switches runtime modes after a loading failure.
+
+## Validated model profiles
+
+| Profile | Hugging Face model | Decoder layers | Hybrid resident | Hybrid streamed |
+| --- | --- | ---: | ---: | ---: |
+| `llama` | `meta-llama/Llama-3.1-8B-Instruct` | 32 | 16 | 16 |
+| `qwen` | `Qwen/Qwen3-14B` | 40 | 24 | 16 |
+
+Llama is a gated checkpoint. Before running it, accept Meta's license terms on the [Llama 3.1 8B Instruct model page](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) and authenticate the local Hugging Face client with an account that has access. AirLLM lists Llama 3.1 among the supported model families in its [project documentation](https://github.com/lyogavin/airllm).
+
+AirLLM shards are stored beneath `AIRLLM_SHARD_ROOT`, currently `C:\AI\airllm-layers`. Each profile has an isolated child directory:
+
+```text
+C:\AI\airllm-layers\llama-3.1-8b-instruct
+C:\AI\airllm-layers\qwen3-14b
+```
+
+This prevents a profile switch from reusing another model's split checkpoint. Change `AIRLLM_SHARD_ROOT` if the shards belong elsewhere.
+AirLLM places the shard files in a `splitted_model` directory inside each listed profile directory.
 
 ## Environment
 
@@ -28,20 +58,27 @@ py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Run the fixed inference:
+Run the selected inference:
 
 ```powershell
 .\.venv\Scripts\python.exe .\airllm_test.py
 ```
 
-Resident mode downloads the original `Qwen/Qwen3-14B` checkpoint through Hugging Face if the weights are not already cached. The download and initial 8-bit loading are included in end-to-end time, but generation throughput is measured only around `generate()` with CUDA synchronization before and after it.
+The fixed prompt asks for a three-sentence explanation of machine learning. All profiles and modes retain the 512-token sequence limit, 64-token output limit, greedy deterministic decoding, CUDA-only execution, and identical metric definitions. Resident downloads and initial loading count toward end-to-end time. Generation throughput is measured only around `generate()`, with CUDA synchronization before and after it.
 
-AirLLM and hybrid modes read or create their split checkpoint under `AIRLLM_SHARD_PATH`, currently `C:\AI\airllm-layers`. Change that constant if the shards are stored elsewhere. Shard compression is not enabled, so hybrid weights retain the checkpoint's native BF16 precision.
+## Fixed hybrid budget and reporting
 
-## Fixed hybrid budget
+Hybrid mode checks the actual sizes of the selected profile's AirLLM shard files before materializing weights. The required budget is the complete resident set plus the largest active streamed layer. If it does not fit in currently free `cuda:0` memory, the script reports the selected model, fixed decoder split, measured resident shard volume, and current free and total VRAM, then stops without fallback.
 
-The hybrid layout is deliberately static. Its 24 resident decoder layers plus embeddings, normalization, and output head occupy 17.66 GiB of BF16 shards. One streamed decoder layer raises the active weight footprint to approximately 18.28 GiB. The 16-layer suffix transfers 9.84 GiB per model forward, compared with 27.51 GiB for pure AirLLM. Remaining VRAM is available for CUDA context, activations, KV cache, and allocator overhead.
+Successful hybrid summaries report the selected model, the fixed decoder split, actual resident shard size, and total streamed weight volume per forward. All modes report input and generated token counts, synchronized generation and end-to-end time, generated tokens per second, and peak allocated and reserved CUDA memory. Generated-token counts and throughput exclude prompt tokens.
 
-Before materializing weights, hybrid mode checks current free and total memory on `cuda:0`. If the fixed resident set plus one active streamed layer does not fit, it reports the requested layer count, resident shard size, and current free and total VRAM, then stops. It never reduces the resident layer count or switches runtime modes. Dynamic hardware-based layer selection is possible using free-VRAM inspection and shard metadata, but it is outside this change and is neither implemented nor designed here.
+## Comparable hardware runs
 
-After each successful response, the script prints a performance summary for input and generated token counts, synchronized generation and end-to-end time, generated tokens per second, and peak allocated and reserved CUDA memory. Hybrid summaries also show the 24/16 decoder split, 17.66 GiB resident shard size, and 9.84 GiB streamed weight volume per forward. Time, throughput, and CUDA memory values use two decimal places. Generated-token counts and throughput exclude prompt tokens.
+For a direct RTX 3090 Ti comparison:
+
+1. Set `MODEL_PROFILE = "llama"` and run `resident`, `airllm`, and `hybrid` in turn.
+2. Confirm the response contains three sentences, the summary identifies the Llama checkpoint, hybrid reports a 16/16 split, and resident validation finds no CPU or disk placement.
+3. Set `MODEL_PROFILE = "qwen"`, select `hybrid`, and run the Qwen baseline once. Confirm the 24/16 split.
+4. Record each complete performance summary without changing the prompt, limits, decoding settings, dependency versions, or other GPU workload.
+
+Do not claim performance parity until both model runs have completed on the same hardware. No hardware benchmark results are checked in by this change.
